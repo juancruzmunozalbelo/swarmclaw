@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "taskKinds": {
+    "planning": {
+      "routeRoles": ["PM", "SPEC", "ARQ"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator", "$swarm-critic-review"],
+          "optional": []
+        },
+        "PM": {
+          "required": ["$swarm-pm-planning", "$project-risk-review"],
+          "optional": ["$github"]
+        },
+        "SPEC": {
+          "required": ["$swarm-spec-contract"],
+          "optional": []
+        },
+        "ARQ": {
+          "required": ["$swarm-arq-decisions"],
+          "optional": []
+        }
+      }
+    },
+    "spec": {
+      "routeRoles": ["SPEC", "ARQ"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator", "$swarm-critic-review"],
+          "optional": []
+        },
+        "SPEC": {
+          "required": ["$swarm-spec-contract"],
+          "optional": ["$project-risk-review"]
+        },
+        "ARQ": {
+          "required": ["$swarm-arq-decisions"],
+          "optional": []
+        }
+      }
+    },
+    "frontend": {
+      "routeRoles": ["UX", "DEV2", "DEV", "QA"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        },
+        "UX": {
+          "required": ["$swarm-dev-implementation"],
+          "optional": ["$project-risk-review"]
+        },
+        "DEV2": {
+          "required": ["$swarm-dev-implementation"],
+          "optional": []
+        },
+        "DEV": {
+          "required": ["$swarm-dev-implementation"],
+          "optional": []
+        },
+        "QA": {
+          "required": ["$swarm-qa-validation"],
+          "optional": []
+        }
+      }
+    },
+    "backend": {
+      "routeRoles": ["SPEC", "DEV", "DEV2", "QA"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        },
+        "SPEC": {
+          "required": ["$swarm-spec-contract"],
+          "optional": []
+        },
+        "DEV": {
+          "required": ["$swarm-dev-implementation"],
+          "optional": ["$codex-risk-bridge"]
+        },
+        "DEV2": {
+          "required": ["$swarm-dev-implementation"],
+          "optional": []
+        },
+        "QA": {
+          "required": ["$swarm-qa-validation"],
+          "optional": []
+        }
+      }
+    },
+    "devops": {
+      "routeRoles": ["DEVOPS"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        },
+        "DEVOPS": {
+          "required": ["$swarm-devops-deploy", "$cloudflare-deploy", "$task-subdomain"],
+          "optional": []
+        },
+        "QA": {
+          "required": [],
+          "optional": ["$swarm-qa-validation"]
+        }
+      }
+    },
+    "qa": {
+      "routeRoles": ["QA"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        },
+        "QA": {
+          "required": ["$swarm-qa-validation"],
+          "optional": ["$project-risk-review"]
+        },
+        "DEV": {
+          "required": [],
+          "optional": ["$swarm-dev-implementation"]
+        }
+      }
+    },
+    "security": {
+      "routeRoles": ["QA", "DEV"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator", "$swarm-critic-review"],
+          "optional": []
+        },
+        "QA": {
+          "required": ["$swarm-qa-validation", "$codex-risk-bridge"],
+          "optional": []
+        },
+        "DEV": {
+          "required": ["$swarm-dev-implementation", "$codex-risk-bridge"],
+          "optional": []
+        }
+      }
+    },
+    "release": {
+      "routeRoles": ["PM", "DEV", "DEV2", "QA"],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        },
+        "PM": {
+          "required": ["$swarm-pm-planning"],
+          "optional": []
+        },
+        "DEV": {
+          "required": ["$github"],
+          "optional": []
+        },
+        "DEV2": {
+          "required": ["$github"],
+          "optional": []
+        },
+        "QA": {
+          "required": ["$swarm-qa-validation"],
+          "optional": []
+        }
+      }
+    },
+    "general": {
+      "routeRoles": [],
+      "roles": {
+        "TEAMLEAD": {
+          "required": ["$swarm-teamlead-orchestrator"],
+          "optional": []
+        }
+      }
+    }
+  }
+}

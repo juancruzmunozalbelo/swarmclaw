@@ -15,6 +15,7 @@
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
   <img src="https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white" alt="Node.js">
   <img src="https://img.shields.io/badge/Claude_Code-Agent_SDK-A78BFA" alt="Claude Code">
+  <img src="https://img.shields.io/badge/Status-Open_Alpha-orange" alt="Open Alpha">
 </p>
 
 <p align="center">
@@ -23,6 +24,9 @@
 </p>
 
 ---
+
+> [!WARNING]
+> **Open Alpha** — SwarmClaw is in active development. Architecture, APIs, and workflow stages may evolve. Feedback and contributions welcome!
 
 ## What is SwarmClaw?
 

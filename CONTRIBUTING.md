@@ -1,5 +1,11 @@
 # Contributing
 
+Please read:
+
+- `CODE_OF_CONDUCT.md`
+- `SECURITY.md` (and `docs/SECURITY.md` for the model)
+- `docs/OPEN_SOURCE_RELEASE.md` for release hygiene
+
 ## Source Code Changes
 
 **Accepted:** Bug fixes, security fixes, simplifications, reducing code.

@@ -7,7 +7,6 @@
  * Usage: npx tsx src/whatsapp-auth.ts
  */
 import fs from 'fs';
-import path from 'path';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import readline from 'readline';
@@ -75,8 +74,8 @@ async function connectSocket(phoneNumber?: string): Promise<void> {
         console.log('  3. Tap "Link with phone number instead"');
         console.log(`  4. Enter this code: ${code}\n`);
         fs.writeFileSync(STATUS_FILE, `pairing_code:${code}`);
-      } catch (err: any) {
-        console.error('Failed to request pairing code:', err.message);
+      } catch (err: unknown) {
+        console.error('Failed to request pairing code:', err instanceof Error ? err.message : String(err));
         process.exit(1);
       }
     }, 3000);
@@ -96,7 +95,8 @@ async function connectSocket(phoneNumber?: string): Promise<void> {
     }
 
     if (connection === 'close') {
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+      const errOutput = (lastDisconnect?.error as Record<string, unknown> | undefined);
+      const reason = (errOutput?.output as Record<string, unknown> | undefined)?.statusCode as number | undefined;
 
       if (reason === DisconnectReason.loggedOut) {
         fs.writeFileSync(STATUS_FILE, 'failed:logged_out');
@@ -121,7 +121,7 @@ async function connectSocket(phoneNumber?: string): Promise<void> {
     if (connection === 'open') {
       fs.writeFileSync(STATUS_FILE, 'authenticated');
       // Clean up QR file now that we're connected
-      try { fs.unlinkSync(QR_FILE); } catch {}
+      try { fs.unlinkSync(QR_FILE); } catch { }
       console.log('\n✓ Successfully authenticated with WhatsApp!');
       console.log('  Credentials saved to store/auth/');
       console.log('  You can now start the NanoClaw service.\n');
@@ -138,8 +138,8 @@ async function authenticate(): Promise<void> {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   // Clean up any stale QR/status files from previous runs
-  try { fs.unlinkSync(QR_FILE); } catch {}
-  try { fs.unlinkSync(STATUS_FILE); } catch {}
+  try { fs.unlinkSync(QR_FILE); } catch { }
+  try { fs.unlinkSync(STATUS_FILE); } catch { }
 
   let phoneNumber = phoneArg;
   if (usePairingCode && !phoneNumber) {

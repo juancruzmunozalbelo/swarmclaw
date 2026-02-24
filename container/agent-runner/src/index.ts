@@ -16,12 +16,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  modelOverride?: string;
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
@@ -117,6 +119,31 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
+function hasBinary(bin: string): boolean {
+  try {
+    execSync(`command -v ${bin}`, { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function logTeamToolUsage(message: unknown): void {
+  const m = message as {
+    type?: string;
+    message?: { content?: Array<{ type?: string; name?: string }> };
+  };
+  if (m?.type !== 'assistant') return;
+  const content = Array.isArray(m?.message?.content) ? m.message!.content! : [];
+  for (const block of content) {
+    if (block?.type !== 'tool_use') continue;
+    const tool = String(block?.name || '');
+    if (tool === 'TeamCreate' || tool === 'TeamDelete' || tool === 'SendMessage') {
+      log(`Team tool used: ${tool}`);
+    }
+  }
+}
+
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
@@ -187,7 +214,11 @@ function createPreCompactHook(): HookCallback {
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+];
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -413,6 +444,47 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const minimaxMcpEnabled =
+    !['0', 'false', 'off', 'no'].includes(String(sdkEnv.MINIMAX_CODING_PLAN_MCP_ENABLED || '1').trim().toLowerCase())
+    && !!String(sdkEnv.MINIMAX_API_KEY || '').trim();
+  const minimaxApiHost = String(sdkEnv.MINIMAX_API_HOST || 'https://api.minimax.io').trim();
+  const canRunUvx = hasBinary('uvx');
+  const mcpServers: Record<string, {
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+  }> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+  if (minimaxMcpEnabled) {
+    if (!canRunUvx) {
+      log('MiniMax MCP requested but uvx is not available in container; skipping MiniMax MCP');
+    } else {
+      const env: Record<string, string> = {
+        MINIMAX_API_KEY: String(sdkEnv.MINIMAX_API_KEY || ''),
+        MINIMAX_API_HOST: minimaxApiHost,
+      };
+      const resourceMode = String(sdkEnv.MINIMAX_API_RESOURCE_MODE || '').trim();
+      const basePath = String(sdkEnv.MINIMAX_MCP_BASE_PATH || '').trim();
+      if (resourceMode) env.MINIMAX_API_RESOURCE_MODE = resourceMode;
+      if (basePath) env.MINIMAX_MCP_BASE_PATH = basePath;
+      mcpServers.MiniMax = {
+        command: 'uvx',
+        args: ['minimax-coding-plan-mcp', '-y'],
+        env,
+      };
+      log('MiniMax MCP enabled (web_search, understand_image)');
+    }
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -431,23 +503,15 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__MiniMax__*',
+        'mcp__minimax__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
+      mcpServers,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
@@ -455,6 +519,7 @@ async function runQuery(
     }
   })) {
     messageCount++;
+    logTeamToolUsage(message);
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
@@ -495,6 +560,17 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    if (containerInput.modelOverride && containerInput.modelOverride.trim()) {
+      const model = containerInput.modelOverride.trim();
+      process.env.ANTHROPIC_MODEL = model;
+      process.env.ANTHROPIC_SONNET_MODEL = model;
+      process.env.ANTHROPIC_SMALL_MODEL = model;
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = model;
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+      log(`Model override active: ${model}`);
+    }
     // Delete the temp file the entrypoint wrote — it contains secrets
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
     log(`Received input for group: ${containerInput.groupFolder}`);

@@ -36,6 +36,7 @@ function getHomeDir(): string {
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  modelOverride?: string;
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
@@ -54,6 +55,72 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function copyDirRecursive(srcDir: string, dstDir: string): void {
+  fs.mkdirSync(dstDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const src = path.join(srcDir, entry.name);
+    const dst = path.join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursive(src, dst);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    fs.copyFileSync(src, dst);
+  }
+}
+
+function syncHostCodexProfile(homeDir: string, dstCodexDir: string): void {
+  const srcCodexDir = path.join(homeDir, '.codex');
+  if (!fs.existsSync(srcCodexDir) || !fs.statSync(srcCodexDir).isDirectory()) return;
+
+  fs.mkdirSync(dstCodexDir, { recursive: true });
+
+  const fileEntries = ['config.toml', 'auth.json', 'version.json'];
+  for (const file of fileEntries) {
+    const src = path.join(srcCodexDir, file);
+    const dst = path.join(dstCodexDir, file);
+    if (fs.existsSync(src) && fs.statSync(src).isFile()) {
+      fs.copyFileSync(src, dst);
+    }
+  }
+
+  const dirEntries = ['skills', 'rules'];
+  for (const dir of dirEntries) {
+    const src = path.join(srcCodexDir, dir);
+    const dst = path.join(dstCodexDir, dir);
+    if (fs.existsSync(src) && fs.statSync(src).isDirectory()) {
+      copyDirRecursive(src, dst);
+    }
+  }
+
+  // Ensure container workspace paths are trusted in cloned Codex config.
+  const configPath = path.join(dstCodexDir, 'config.toml');
+  const trustBlocks = [
+    '[projects."/workspace/project"]\ntrust_level = "trusted"\n',
+    '[projects."/workspace/group"]\ntrust_level = "trusted"\n',
+  ];
+  let configContent = '';
+  if (fs.existsSync(configPath)) {
+    try {
+      configContent = fs.readFileSync(configPath, 'utf-8');
+    } catch {
+      configContent = '';
+    }
+  }
+  let changed = false;
+  for (const block of trustBlocks) {
+    const header = block.split('\n')[0];
+    if (!configContent.includes(header)) {
+      if (configContent && !configContent.endsWith('\n')) configContent += '\n';
+      configContent += `\n${block}`;
+      changed = true;
+    }
+  }
+  if (changed) {
+    fs.writeFileSync(configPath, configContent, 'utf-8');
+  }
 }
 
 function buildVolumeMounts(
@@ -108,21 +175,122 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(settingsFile, JSON.stringify({
-      env: {
-        // Enable agent swarms (subagent orchestration)
-        // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-        // Load CLAUDE.md from additional mounted directories
-        // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-        // Enable Claude's memory feature (persists user preferences between sessions)
-        // https://code.claude.com/docs/en/memory#manage-auto-memory
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-      },
-    }, null, 2) + '\n');
+  // Keep per-group Claude settings in sync: create if missing, then merge updates.
+  const baseEnv: Record<string, string> = {
+    // Enable agent swarms (subagent orchestration)
+    // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    // Load CLAUDE.md from additional mounted directories
+    // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    // Enable Claude's memory feature (persists user preferences between sessions)
+    // https://code.claude.com/docs/en/memory#manage-auto-memory
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  };
+
+  const resolveIndirect = (raw: string): string => {
+    const v = raw.trim();
+    const m = v.match(/^\$\{([A-Z0-9_]+)\}$/);
+    if (m) return (process.env[m[1]] || '').trim();
+    return v;
+  };
+
+  const loadDotEnv = (): Record<string, string> => {
+    const envPath = path.join(process.cwd(), '.env');
+    if (!fs.existsSync(envPath)) return {};
+    const out: Record<string, string> = {};
+    const content = fs.readFileSync(envPath, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let value = trimmed.slice(eqIdx + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+    return out;
+  };
+
+  let existingEnv: Record<string, string> = {};
+  if (fs.existsSync(settingsFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as {
+        env?: Record<string, string>;
+      };
+      existingEnv = parsed.env || {};
+    } catch {
+      existingEnv = {};
+    }
   }
+
+  const env: Record<string, string> = { ...baseEnv, ...existingEnv };
+
+  const loadClaudeUserSettingsEnv = (): Record<string, string> => {
+    try {
+      const home = process.env.HOME || os.homedir();
+      if (!home) return {};
+      const p = path.join(home, '.claude', 'settings.json');
+      if (!fs.existsSync(p)) return {};
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf-8')) as {
+        env?: Record<string, unknown>;
+      };
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed.env || {})) {
+        if (typeof v === 'string') out[k] = v;
+        else if (typeof v === 'number') out[k] = String(v);
+        else if (typeof v === 'boolean') out[k] = v ? '1' : '0';
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  };
+
+  // If the host has set an Anthropic-compatible base URL / model prefs (e.g. MiniMax),
+  // propagate them into the per-group Claude settings inside the container.
+  // Secrets are still passed separately via stdin (see readSecrets()).
+  const passthroughKeys = [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_SONNET_MODEL',
+    'ANTHROPIC_SMALL_MODEL',
+    'ANTHROPIC_SMALL_FAST_MODEL',
+    'ANTHROPIC_SMALL_REASONING_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'API_TIMEOUT_MS',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+    // Runtime app/deploy env (needed so agents can run services without asking for sudo).
+    'DATABASE_URL',
+    'DATABASE_URL_MAIN',
+    'JWT_SECRET',
+    'PORT',
+    'HOST',
+    'PGHOST',
+    'PGPORT',
+    'PGUSER',
+    'PGPASSWORD',
+    'PGDATABASE',
+  ] as const;
+
+  const dotEnv = loadDotEnv();
+  const userClaudeEnv = loadClaudeUserSettingsEnv();
+  for (const key of passthroughKeys) {
+    const raw = dotEnv[key] ?? process.env[key] ?? userClaudeEnv[key];
+    if (!raw) continue;
+    const v = resolveIndirect(String(raw));
+    if (v && v.trim()) env[key] = v.trim();
+  }
+
+  fs.writeFileSync(settingsFile, JSON.stringify({ env }, null, 2) + '\n');
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -132,17 +300,36 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.mkdirSync(dstDir, { recursive: true });
-      for (const file of fs.readdirSync(srcDir)) {
-        const srcFile = path.join(srcDir, file);
-        const dstFile = path.join(dstDir, file);
-        fs.copyFileSync(srcFile, dstFile);
-      }
+      copyDirRecursive(srcDir, dstDir);
     }
   }
+
+  // Sync host Claude teams into each group's isolated session home so TeamCreate/SendMessage
+  // can use the same team definitions configured on the host.
+  const hostTeamsSrc = path.join(homeDir, '.claude', 'teams');
+  const sessionTeamsDst = path.join(groupSessionsDir, 'teams');
+  if (fs.existsSync(hostTeamsSrc) && fs.statSync(hostTeamsSrc).isDirectory()) {
+    copyDirRecursive(hostTeamsSrc, sessionTeamsDst);
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
+    readonly: false,
+  });
+
+  // Per-group Codex profile so codex CLI inside containers can reuse host config/auth/skills.
+  // Keep it scoped per group to avoid cross-group session leakage.
+  const groupCodexDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.codex',
+  );
+  syncHostCodexProfile(homeDir, groupCodexDir);
+  mounts.push({
+    hostPath: groupCodexDir,
+    containerPath: '/home/node/.codex',
     readonly: false,
   });
 
@@ -186,27 +373,72 @@ function buildVolumeMounts(
  */
 function readSecrets(): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
-  if (!fs.existsSync(envFile)) return {};
-
-  const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+  const allowedVars = [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'MINIMAX_API_KEY',
+    'MINIMAX_API_HOST',
+    'MINIMAX_API_RESOURCE_MODE',
+    'MINIMAX_MCP_BASE_PATH',
+    'MINIMAX_CODING_PLAN_MCP_ENABLED',
+    'CLOUDFLARE_API_TOKEN',
+    'CLOUDFLARE_ZONE_ID',
+    'CLOUDFLARE_ZONE_NAME',
+    'CLOUDFLARE_TUNNEL_TARGET',
+  ];
   const secrets: Record<string, string> = {};
-  const content = fs.readFileSync(envFile, 'utf-8');
 
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    if (!allowedVars.includes(key)) continue;
-    let value = trimmed.slice(eqIdx + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
+  const resolve = (raw: string): string => {
+    const v = raw.trim();
+    // Allow simple indirection like ANTHROPIC_API_KEY=${MINIMAX_API_KEY}
+    const m = v.match(/^\$\{([A-Z0-9_]+)\}$/);
+    if (m) return (process.env[m[1]] || '').trim();
+    return v;
+  };
+
+  // 1) Load from project .env if present
+  if (fs.existsSync(envFile)) {
+    const content = fs.readFileSync(envFile, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (!allowedVars.includes(key)) continue;
+      let value = trimmed.slice(eqIdx + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      value = resolve(value);
+      if (value) secrets[key] = value;
     }
-    if (value) secrets[key] = value;
+  }
+
+  // 2) Fall back to host env (useful when secrets are stored in login profiles/keychains)
+  for (const key of allowedVars) {
+    if (secrets[key]) continue;
+    const v = (process.env[key] || '').trim();
+    if (v) secrets[key] = v;
+  }
+
+  // Convenience: if using an Anthropic-compatible proxy (e.g. MiniMax),
+  // prefer ANTHROPIC_AUTH_TOKEN and avoid setting both AUTH_TOKEN and API_KEY at once.
+  const minimaxKey = (process.env.MINIMAX_API_KEY || '').trim();
+  if (minimaxKey && !secrets.ANTHROPIC_AUTH_TOKEN) {
+    secrets.ANTHROPIC_AUTH_TOKEN = minimaxKey;
+  }
+  // If an API key was implicitly the same as the MiniMax key, drop it to avoid conflicts.
+  if (
+    minimaxKey &&
+    secrets.ANTHROPIC_API_KEY &&
+    secrets.ANTHROPIC_API_KEY.trim() === minimaxKey
+  ) {
+    delete secrets.ANTHROPIC_API_KEY;
   }
 
   return secrets;
@@ -379,9 +611,9 @@ export async function runContainerAgent(
     // graceful _close sentinel has time to trigger before the hard kill fires.
     const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
 
-    const killOnTimeout = () => {
+    const killOnTimeout = (reason: 'idle' | 'absolute') => {
       timedOut = true;
-      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
+      logger.error({ group: group.name, containerName, reason }, `Container ${reason} timeout, stopping gracefully`);
       exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
@@ -390,16 +622,19 @@ export async function runContainerAgent(
       });
     };
 
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
+    const ABSOLUTE_MAX_RUN_MS = Math.max(timeoutMs * 2, 10 * 60 * 1000); // 10 minutes minimum
+    let idleTimeout = setTimeout(() => killOnTimeout('idle'), timeoutMs);
+    const absoluteTimeout = setTimeout(() => killOnTimeout('absolute'), ABSOLUTE_MAX_RUN_MS);
 
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
+      clearTimeout(idleTimeout);
+      idleTimeout = setTimeout(() => killOnTimeout('idle'), timeoutMs);
     };
 
     container.on('close', (code) => {
-      clearTimeout(timeout);
+      clearTimeout(idleTimeout);
+      clearTimeout(absoluteTimeout);
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -590,7 +825,8 @@ export async function runContainerAgent(
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
+      clearTimeout(idleTimeout);
+      clearTimeout(absoluteTimeout);
       logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
       resolve({
         status: 'error',
@@ -643,7 +879,7 @@ export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>,
+  _registeredJids: Set<string>,
 ): void {
   const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });

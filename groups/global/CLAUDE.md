@@ -30,6 +30,38 @@ Here are the key findings from the research...
 
 Text inside `<internal>` tags is logged but not sent to the user. If you've already sent the key information via `send_message`, you can wrap the recap in `<internal>` to avoid sending it again.
 
+### Comunicación proactiva (OBLIGATORIO)
+
+Cuando recibís un mensaje con una tarea:
+
+1. **Ack inmediato** — Dentro de los primeros 5 segundos, usar `send_message` para confirmar que lo recibiste:
+   ```
+   OK en proceso: [resumen de 1 línea]
+   ```
+
+2. **Plan breve** — Antes de ejecutar, comunicar cómo vas a dividir el trabajo:
+   ```
+   Plan:
+   1. [subtarea 1]
+   2. [subtarea 2]
+   3. [subtarea 3]
+   Tiempo estimado: ~X min
+   ```
+
+3. **Updates de progreso** — Después de cada subtarea importante, enviar update breve via `send_message`:
+   ```
+   ✅ 1/3 — [subtarea completada]
+   ⏳ 2/3 — [siguiente subtarea]...
+   ```
+
+4. **Preguntas cuando corresponde** — Si el pedido es ambiguo, PREGUNTAR con opciones antes de implementar:
+   ```
+   Antes de arrancar necesito definir:
+   • OPCIÓN A: [descripción] — [impacto]
+   • OPCIÓN B (recomendada): [descripción] — [impacto]
+   Si no contestás, voy con B.
+   ```
+
 ### Sub-agents and teammates
 
 When working as a sub-agent or teammate, only use `send_message` if instructed to by the main agent.

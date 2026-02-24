@@ -66,7 +66,7 @@ export function loadMountAllowlist(): MountAllowlist | null {
       logger.warn(
         { path: MOUNT_ALLOWLIST_PATH },
         'Mount allowlist not found - additional mounts will be BLOCKED. ' +
-          'Create the file to enable additional mounts.',
+        'Create the file to enable additional mounts.',
       );
       return null;
     }
@@ -383,36 +383,4 @@ export function validateAdditionalMounts(
   return validatedMounts;
 }
 
-/**
- * Generate a template allowlist file for users to customize
- */
-export function generateAllowlistTemplate(): string {
-  const template: MountAllowlist = {
-    allowedRoots: [
-      {
-        path: '~/projects',
-        allowReadWrite: true,
-        description: 'Development projects',
-      },
-      {
-        path: '~/repos',
-        allowReadWrite: true,
-        description: 'Git repositories',
-      },
-      {
-        path: '~/Documents/work',
-        allowReadWrite: false,
-        description: 'Work documents (read-only)',
-      },
-    ],
-    blockedPatterns: [
-      // Additional patterns beyond defaults
-      'password',
-      'secret',
-      'token',
-    ],
-    nonMainReadOnly: true,
-  };
 
-  return JSON.stringify(template, null, 2);
-}

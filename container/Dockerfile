@@ -3,6 +3,9 @@
 
 FROM node:22-slim
 
+# Prefer IPv4 for DNS results (Apple Container NAT is IPv4; IPv6-first can hang).
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
+
 # Install system dependencies for Chromium
 RUN apt-get update && apt-get install -y \
     chromium \
@@ -23,14 +26,15 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser, claude-code and codex CLI globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code @openai/codex
 
 # Create app directory
 WORKDIR /app

@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose an improvement to core NanoClaw or a new skill idea
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before requesting a core feature, consider whether this should be a skill.
+  - type: dropdown
+    id: type
+    attributes:
+      label: Request type
+      options:
+        - Skill idea (.claude/skills/)
+        - Core fix/simplification
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe expected behavior and scope
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or competing approaches?

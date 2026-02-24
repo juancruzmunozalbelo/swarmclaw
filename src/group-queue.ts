@@ -13,6 +13,7 @@ interface QueuedTask {
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
+const ACTIVE_CONTAINERS_PATH = path.join(DATA_DIR, '..', 'store', 'active-containers.json');
 
 interface GroupState {
   active: boolean;
@@ -31,6 +32,41 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+
+  private persistActiveContainers(): void {
+    try {
+      const active: Array<{
+        groupJid: string;
+        groupFolder: string | null;
+        containerName: string;
+      }> = [];
+      for (const [groupJid, state] of this.groups.entries()) {
+        if (!state.active || !state.containerName) continue;
+        active.push({
+          groupJid,
+          groupFolder: state.groupFolder || null,
+          containerName: state.containerName,
+        });
+      }
+      fs.mkdirSync(path.dirname(ACTIVE_CONTAINERS_PATH), { recursive: true });
+      const tmp = `${ACTIVE_CONTAINERS_PATH}.tmp`;
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify(
+          {
+            updatedAt: new Date().toISOString(),
+            active,
+          },
+          null,
+          2,
+        ) + '\n',
+        'utf-8',
+      );
+      fs.renameSync(tmp, ACTIVE_CONTAINERS_PATH);
+    } catch {
+      // ignore
+    }
+  }
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -117,6 +153,7 @@ export class GroupQueue {
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+    this.persistActiveContainers();
   }
 
   /**
@@ -188,6 +225,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      this.persistActiveContainers();
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -212,6 +250,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      this.persistActiveContainers();
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -281,22 +320,60 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
+    const graceMs = Number.isFinite(gracePeriodMs) && gracePeriodMs > 0
+      ? Math.max(1000, Math.min(gracePeriodMs, 30000))
+      : 10000;
     const activeContainers: string[] = [];
-    for (const [jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
-      }
+    const waiters: Promise<void>[] = [];
+
+    for (const [, state] of this.groups) {
+      if (!state.process || !state.containerName || state.process.killed) continue;
+      activeContainers.push(state.containerName);
+      const proc = state.process;
+      waiters.push(new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          resolve();
+        };
+        proc.once('exit', finish);
+        try {
+          proc.kill('SIGTERM');
+        } catch {
+          finish();
+          return;
+        }
+        setTimeout(() => {
+          if (!proc.killed) {
+            try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+          }
+          finish();
+        }, graceMs);
+      }));
     }
 
+    await Promise.all(waiters);
+
+    for (const [, state] of this.groups) {
+      state.active = false;
+      state.pendingMessages = false;
+      state.pendingTasks = [];
+      state.process = null;
+      state.containerName = null;
+      state.groupFolder = null;
+      state.retryCount = 0;
+    }
+    this.activeCount = 0;
+    this.waitingGroups = [];
+
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: activeContainers.length, terminatedContainers: activeContainers, graceMs },
+      'GroupQueue shutting down (active containers terminated)',
     );
+    this.persistActiveContainers();
   }
 }

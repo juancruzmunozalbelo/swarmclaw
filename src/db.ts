@@ -72,6 +72,47 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS workflow_tasks (
+      task_id TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      stage TEXT NOT NULL DEFAULT 'TEAMLEAD',
+      status TEXT NOT NULL DEFAULT 'running',
+      retries INTEGER NOT NULL DEFAULT 0,
+      pending_questions TEXT DEFAULT '[]',
+      decisions TEXT DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_error TEXT,
+      PRIMARY KEY (task_id, group_folder)
+    );
+    CREATE INDEX IF NOT EXISTS idx_wf_group ON workflow_tasks(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_wf_status ON workflow_tasks(status);
+
+    CREATE TABLE IF NOT EXISTS workflow_transitions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      ts TEXT NOT NULL,
+      from_stage TEXT NOT NULL,
+      to_stage TEXT NOT NULL,
+      reason TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_wt_task ON workflow_transitions(task_id, group_folder);
+
+    CREATE TABLE IF NOT EXISTS lane_states (
+      task_id TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      role TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'idle',
+      updated_at TEXT NOT NULL,
+      detail TEXT,
+      summary TEXT,
+      dependency TEXT,
+      PRIMARY KEY (task_id, group_folder, role)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ls_group ON lane_states(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_ls_task ON lane_states(task_id, group_folder);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -82,14 +123,42 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+
+  // Add tokens_used column to workflow_tasks (Sprint 2 migration)
+  try {
+    database.exec(
+      `ALTER TABLE workflow_tasks ADD COLUMN tokens_used INTEGER DEFAULT 0`,
+    );
+  } catch {
+    /* column already exists */
+  }
 }
 
 export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  db = new Database(dbPath);
-  createSchema(db);
+  try {
+    db = new Database(dbPath);
+    // Healthcheck: verify DB is readable before proceeding
+    db.prepare('SELECT 1').get();
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    createSchema(db);
+  } catch {
+    // DB is likely corrupted — back it up and start fresh
+    const backup = `${dbPath}.corrupt.${Date.now()}`;
+    try {
+      db?.close();
+      fs.renameSync(dbPath, backup);
+      console.error(`[db] DB corrupta — backup en ${backup}, recreando desde cero`);
+    } catch {
+      // ignore rename errors (file may not exist)
+    }
+    db = new Database(dbPath);
+    db.prepare('SELECT 1').get(); // must succeed on fresh DB
+    createSchema(db);
+  }
 
   // Migrate from JSON files if they exist
   migrateJsonState();
@@ -206,30 +275,7 @@ export function storeMessage(msg: NewMessage): void {
   );
 }
 
-/**
- * Store a message directly (for non-WhatsApp channels that don't use Baileys proto).
- */
-export function storeMessageDirect(msg: {
-  id: string;
-  chat_jid: string;
-  sender: string;
-  sender_name: string;
-  content: string;
-  timestamp: string;
-  is_from_me: boolean;
-}): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-  );
-}
+
 
 export function getNewMessages(
   jids: string[],
@@ -304,13 +350,7 @@ export function getTaskById(id: string): ScheduledTask | undefined {
     | undefined;
 }
 
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
-    .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
-    )
-    .all(groupFolder) as ScheduledTask[];
-}
+
 
 export function getAllTasks(): ScheduledTask[] {
   return db
@@ -426,17 +466,16 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
-  const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
-}
+
 
 export function setSession(groupFolder: string, sessionId: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
   ).run(groupFolder, sessionId);
+}
+
+export function clearSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
 export function getAllSessions(): Record<string, string> {
@@ -459,14 +498,14 @@ export function getRegisteredGroup(
     .prepare('SELECT * FROM registered_groups WHERE jid = ?')
     .get(jid) as
     | {
-        jid: string;
-        name: string;
-        folder: string;
-        trigger_pattern: string;
-        added_at: string;
-        container_config: string | null;
-        requires_trigger: number | null;
-      }
+      jid: string;
+      name: string;
+      folder: string;
+      trigger_pattern: string;
+      added_at: string;
+      container_config: string | null;
+      requires_trigger: number | null;
+    }
     | undefined;
   if (!row) return undefined;
   return {
@@ -504,14 +543,14 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db
     .prepare('SELECT * FROM registered_groups')
     .all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    trigger_pattern: string;
-    added_at: string;
-    container_config: string | null;
-    requires_trigger: number | null;
-  }>;
+      jid: string;
+      name: string;
+      folder: string;
+      trigger_pattern: string;
+      added_at: string;
+      container_config: string | null;
+      requires_trigger: number | null;
+    }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
     result[row.jid] = {
@@ -526,6 +565,278 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Workflow state accessors ---
+
+export interface WorkflowTaskRow {
+  task_id: string;
+  group_folder: string;
+  stage: string;
+  status: string;
+  retries: number;
+  pending_questions: string;
+  decisions: string;
+  created_at: string;
+  updated_at: string;
+  last_error: string | null;
+}
+
+export interface WorkflowTransitionRow {
+  id: number;
+  task_id: string;
+  group_folder: string;
+  ts: string;
+  from_stage: string;
+  to_stage: string;
+  reason: string | null;
+}
+
+export function upsertWorkflowTask(params: {
+  taskId: string;
+  groupFolder: string;
+  stage: string;
+  status: string;
+  retries: number;
+  pendingQuestions: string[];
+  decisions: string[];
+  lastError?: string | null;
+  tokensUsed?: number;
+  expectedStage?: string;
+}): boolean {
+  const now = new Date().toISOString();
+
+  if (params.expectedStage) {
+    const info = db.prepare(`
+      UPDATE workflow_tasks SET
+        stage = ?, status = ?, retries = ?, pending_questions = ?, decisions = ?, updated_at = ?, last_error = ?,
+        tokens_used = CASE WHEN ? IS NOT NULL THEN ? ELSE tokens_used END
+      WHERE task_id = ? AND group_folder = ? AND stage = ?
+    `).run(
+      params.stage, params.status, params.retries, JSON.stringify(params.pendingQuestions), JSON.stringify(params.decisions), now, params.lastError ?? null,
+      params.tokensUsed ?? null, params.tokensUsed ?? null,
+      params.taskId, params.groupFolder, params.expectedStage
+    );
+    if (info.changes === 0) {
+      const exists = db.prepare('SELECT 1 FROM workflow_tasks WHERE task_id = ? AND group_folder = ?').get(params.taskId, params.groupFolder);
+      if (exists) return false; // OCC failed: dirty write
+    } else {
+      return true;
+    }
+  }
+
+  db.prepare(`
+    INSERT INTO workflow_tasks (task_id, group_folder, stage, status, retries, pending_questions, decisions, created_at, updated_at, last_error, tokens_used)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id, group_folder) DO UPDATE SET
+      stage = excluded.stage,
+      status = excluded.status,
+      retries = excluded.retries,
+      pending_questions = excluded.pending_questions,
+      decisions = excluded.decisions,
+      updated_at = excluded.updated_at,
+      last_error = excluded.last_error,
+      tokens_used = CASE
+        WHEN excluded.tokens_used IS NOT NULL THEN excluded.tokens_used
+        ELSE workflow_tasks.tokens_used
+      END
+  `).run(
+    params.taskId,
+    params.groupFolder,
+    params.stage,
+    params.status,
+    params.retries,
+    JSON.stringify(params.pendingQuestions),
+    JSON.stringify(params.decisions),
+    now,
+    now,
+    params.lastError ?? null,
+    params.tokensUsed ?? null,
+  );
+  return true;
+}
+
+export function getWorkflowTask(taskId: string, groupFolder: string): WorkflowTaskRow | undefined {
+  return db.prepare(
+    'SELECT * FROM workflow_tasks WHERE task_id = ? AND group_folder = ?',
+  ).get(taskId, groupFolder) as WorkflowTaskRow | undefined;
+}
+
+export function getWorkflowTasksByGroup(groupFolder: string): WorkflowTaskRow[] {
+  return db.prepare(
+    'SELECT * FROM workflow_tasks WHERE group_folder = ? ORDER BY updated_at DESC',
+  ).all(groupFolder) as WorkflowTaskRow[];
+}
+
+export function getBlockedWorkflowTasks(groupFolder: string): WorkflowTaskRow[] {
+  return db.prepare(
+    "SELECT * FROM workflow_tasks WHERE group_folder = ? AND status = 'blocked' ORDER BY updated_at DESC",
+  ).all(groupFolder) as WorkflowTaskRow[];
+}
+
+export function insertWorkflowTransition(params: {
+  taskId: string;
+  groupFolder: string;
+  fromStage: string;
+  toStage: string;
+  reason?: string;
+}): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO workflow_transitions(task_id, group_folder, ts, from_stage, to_stage, reason)
+    VALUES(?, ?, ?, ?, ?, ?)
+      `).run(
+    params.taskId,
+    params.groupFolder,
+    now,
+    params.fromStage,
+    params.toStage,
+    params.reason ?? null,
+  );
+}
+
+export function getWorkflowTransitions(taskId: string, groupFolder: string): WorkflowTransitionRow[] {
+  return db.prepare(
+    'SELECT * FROM workflow_transitions WHERE task_id = ? AND group_folder = ? ORDER BY ts',
+  ).all(taskId, groupFolder) as WorkflowTransitionRow[];
+}
+
+export function deleteWorkflowTask(taskId: string, groupFolder: string): void {
+  db.prepare('DELETE FROM workflow_transitions WHERE task_id = ? AND group_folder = ?').run(taskId, groupFolder);
+  db.prepare('DELETE FROM workflow_tasks WHERE task_id = ? AND group_folder = ?').run(taskId, groupFolder);
+}
+
+
+
+// --- Lane state accessors ---
+
+export interface LaneStateRow {
+  task_id: string;
+  group_folder: string;
+  role: string;
+  state: string;
+  updated_at: string;
+  detail: string | null;
+  summary: string | null;
+  dependency: string | null;
+}
+
+export function upsertLaneState(params: {
+  taskId: string;
+  groupFolder: string;
+  role: string;
+  state: string;
+  detail?: string | null;
+  summary?: string | null;
+  dependency?: string | null;
+  updatedAt?: string;
+}): void {
+  const now = params.updatedAt || new Date().toISOString();
+  db.prepare(`
+    INSERT INTO lane_states(task_id, group_folder, role, state, updated_at, detail, summary, dependency)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id, group_folder, role) DO UPDATE SET
+      state = excluded.state,
+    updated_at = excluded.updated_at,
+    detail = excluded.detail,
+    summary = excluded.summary,
+    dependency = excluded.dependency
+      `).run(
+    params.taskId.trim().toUpperCase(),
+    params.groupFolder,
+    params.role,
+    params.state,
+    now,
+    params.detail ?? null,
+    params.summary ?? null,
+    params.dependency ?? null,
+  );
+}
+
+export function getLaneStatesForTask(taskId: string, groupFolder: string): LaneStateRow[] {
+  return db.prepare(
+    'SELECT * FROM lane_states WHERE task_id = ? AND group_folder = ?',
+  ).all(taskId.trim().toUpperCase(), groupFolder) as LaneStateRow[];
+}
+
+export function getLaneStatesForGroup(groupFolder: string): LaneStateRow[] {
+  return db.prepare(
+    'SELECT * FROM lane_states WHERE group_folder = ? ORDER BY task_id, role',
+  ).all(groupFolder) as LaneStateRow[];
+}
+
+
+
+export function updateStaleLaneStates(params: {
+  groupFolder: string;
+  staleMs: number;
+  newState: string;
+  detail: string;
+}): { count: number; taskIds: string[] } {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - Math.max(60_000, params.staleMs)).toISOString();
+  const activeStates = ['queued', 'working', 'waiting'];
+  const placeholders = activeStates.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT task_id, role FROM lane_states
+    WHERE group_folder = ? AND state IN(${placeholders}) AND updated_at < ?
+    `).all(params.groupFolder, ...activeStates, cutoff) as Array<{ task_id: string; role: string }>;
+
+  if (rows.length === 0) return { count: 0, taskIds: [] };
+
+  const nowIso = now.toISOString();
+  const stmt = db.prepare(`
+    UPDATE lane_states SET state = ?, updated_at = ?, detail = ?
+    WHERE task_id = ? AND group_folder = ? AND role = ?
+      `);
+  const taskIds = new Set<string>();
+  for (const row of rows) {
+    stmt.run(params.newState, nowIso, params.detail, row.task_id, params.groupFolder, row.role);
+    taskIds.add(row.task_id);
+  }
+  return { count: rows.length, taskIds: [...taskIds] };
+}
+
+export function syncLanesWithWorkflow(groupFolder: string): { count: number; taskIds: string[] } {
+  const activeStates = ['queued', 'working', 'waiting'];
+  const placeholders = activeStates.map(() => '?').join(',');
+
+  // Match active lanes where EITHER:
+  //   (a) a workflow_task exists but is NOT running (split-brain), OR
+  //   (b) no workflow_task exists at all (orphan lane from a crash)
+  const condition = `
+    group_folder = ? AND state IN (${placeholders})
+    AND (
+      EXISTS (
+        SELECT 1 FROM workflow_tasks wt
+        WHERE wt.task_id = lane_states.task_id
+        AND wt.group_folder = lane_states.group_folder
+        AND wt.status != 'running'
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM workflow_tasks wt
+        WHERE wt.task_id = lane_states.task_id
+        AND wt.group_folder = lane_states.group_folder
+      )
+    )
+  `;
+
+  const rows = db.prepare(
+    `SELECT DISTINCT task_id FROM lane_states WHERE ${condition}`
+  ).all(groupFolder, ...activeStates) as Array<{ task_id: string }>;
+
+  if (rows.length === 0) return { count: 0, taskIds: [] };
+
+  const taskIds = new Set(rows.map(r => r.task_id));
+  const nowIso = new Date().toISOString();
+
+  db.prepare(`
+    UPDATE lane_states
+    SET state = 'error', updated_at = ?, detail = 'boot recovery: overridden by workflow source of truth'
+    WHERE ${condition}
+  `).run(nowIso, groupFolder, ...activeStates);
+
+  return { count: rows.length, taskIds: [...taskIds] };
 }
 
 // --- JSON migration ---

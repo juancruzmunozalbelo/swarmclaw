@@ -16,3 +16,33 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npx vitest run
+      - run: npm run oss:preflight
+
+  landing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate landing HTML
+        run: |
+          # Check HTML files exist and have required tags
+          for f in groups/main/landing-equipo.html; do
+            if [ -f "$f" ]; then
+              echo "Validating $f..."
+              # Check for required meta tags
+              grep -q '<meta name="description"' "$f" || { echo "Missing description meta tag in $f"; exit 1; }
+              grep -q '<meta property="og:' "$f" || { echo "Missing OG meta tags in $f"; exit 1; }
+              grep -q '<title>' "$f" || { echo "Missing title tag in $f"; exit 1; }
+              echo "$f OK"
+            fi
+          done
+      - name: Validate QA evidence
+        run: |
+          # Check QA files exist and have screenshot evidence
+          for f in groups/main/swarmdev/qa_landing.md; do
+            if [ -f "$f" ]; then
+              echo "Validating $f..."
+              # Check screenshot reference exists
+              grep -q 'landing-screenshot.png' "$f" || { echo "Missing screenshot reference in $f"; exit 1; }
+              echo "$f OK"
+            fi
+          done

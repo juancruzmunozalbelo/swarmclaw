@@ -18,6 +18,8 @@ groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 
+# Runtime artifacts (do not publish personal/project-specific generated files)
+
 # Secrets
 *.keys.json
 .env

@@ -1,34 +1,46 @@
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
+  setupPhase,
+  preflightPhase,
+  timersPhase,
+  buildOutputCallback,
+  cleanupPhase,
+} from './phases/index.js';
+
+import {
   ASSISTANT_NAME,
   DATA_DIR,
-  IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MAIN_CONTEXT_MESSAGES,
+  BOOT_STALE_RUNNING_MS,
+  BOOT_MAX_RUNNING_TASKS,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
+import { maybeSendProcessingAck } from './processing-ack.js';
+import { dispatchParallelLanes } from './parallel-dispatch.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
-  ContainerOutput,
-  runContainerAgent,
   writeGroupsSnapshot,
-  writeTasksSnapshot,
 } from './container-runner.js';
+import { updateSwarmStatus } from './swarm-status.js';
+import { writeSwarmMetrics } from './metrics.js';
+import { appendSwarmAction, appendSwarmEvent } from './swarm-events.js';
+import {
+  reconcileWorkflowOnBoot,
+} from './swarm-workflow.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
-  getAllTasks,
   getMessagesSince,
   getNewMessages,
   getRouterState,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
-  setSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -36,8 +48,29 @@ import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
 import { formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { ensureContainerSystemRunning } from './container-boot.js';
+import { loadCircuitBreakerState } from './model-circuit.js';
+import { loadSecrets, KNOWN_SECRETS } from './secrets-vault.js';
+import { startLivenessProbeLoop } from './liveness-probes.js';
+import {
+  inferStageHint,
+} from './text-helpers.js';
+export type { ExecutionTrack } from './text-helpers.js';
+export type { SubagentRole, TaskKind } from './prompt-builder.js';
+
+import {
+  syncTodoLaneProgressFromLaneState,
+  reconcileLaneStateOnBoot,
+  trimMainContextMessages,
+} from './lane-manager.js';
+export type { LaneState, LaneSnapshot, TaskLaneState, LaneStateFile } from './lane-manager.js';
+
+import {
+  setTodoState,
+} from './todo-manager.js';
+import { runAgent, type AgentRunnerDeps } from './agent-runner.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -48,8 +81,20 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
+let channel: Channel;
 const queue = new GroupQueue();
+
+const sessionLifecycleByKey = new Map<string, { startedAt: number; cycles: number }>();
+
+
+
+
+
+
+
+
+
+
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -113,180 +158,83 @@ export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): v
   registeredGroups = groups;
 }
 
+function buildAgentRunnerDeps(): AgentRunnerDeps {
+  return {
+    sessions,
+    sessionLifecycleByKey,
+    registeredGroups,
+    queue: {
+      registerProcess: (jid, proc, containerName, groupFolder) =>
+        queue.registerProcess(jid, proc as import('child_process').ChildProcess, containerName, groupFolder),
+    },
+    getAvailableGroups,
+    saveState,
+  };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
+ *
+ * Sprint 4 — Rewritten as thin orchestrator.
+ * Phases 1, 2, 3, 4, 5 are in src/phases/.
+ * Only `maybeDispatchParallelSubagents` remains inline (362 lines).
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  // ── Phase 1: Setup & Message Fetch ─────────────────────────────────
+  const ctx = await setupPhase(chatJid, group, lastAgentTimestamp);
+  if (!ctx) return true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
+  // Destructure for maybeDispatchParallelSubagents closure compatibility
+  const { isMainGroup, stageHint, missedMessages } = ctx;
+  let { taskIds } = ctx;
+
+  // ── Phase 2a: Pre-flight (non-dispatch) ────────────────────────────
+  preflightPhase(ctx);
+  // Sync taskIds back (preflightPhase may have modified ctx.taskIds)
+  taskIds = ctx.taskIds;
+  // ── Phase 2b: Parallel Dispatch (via extracted module) ─────────────
+  dispatchParallelLanes({
+    group,
+    taskIds,
+    stageHint,
+    missedMessages,
     chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
-    );
-    if (!hasTrigger) return true;
-  }
-
-  const prompt = formatMessages(missedMessages);
-
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
-
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
-  );
-
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug({ group: group.name }, 'Idle timeout, closing container stdin');
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
-  };
-
-  await whatsapp.setTyping(chatJid, true);
-  let hadError = false;
-  let outputSentToUser = false;
-
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await whatsapp.sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
-        outputSentToUser = true;
-      }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
-
-    if (result.status === 'error') {
-      hadError = true;
-    }
+    isMainGroup,
+    deps: {
+      buildAgentRunnerDeps,
+      sessionLifecycleByKey,
+      sendNotification: (jid, text) => { try { channel.sendMessage(jid, text); } catch { /* ignore */ } },
+    },
   });
 
-  await whatsapp.setTyping(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
+  // ── Phase 3: Cursor Advance & Timer Setup ──────────────────────────
+  const timers = await timersPhase(ctx, {
+    channel,
+    queue,
+    lastAgentTimestamp,
+    saveState,
+  });
 
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
-      logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
-      return true;
-    }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-    return false;
-  }
+  // ── Phase 4: Agent Execution & Output Processing ───────────────────
+  const outputCallback = buildOutputCallback(ctx, timers, { channel, queue });
+  const output = await runAgent(group, ctx.prompt, chatJid, buildAgentRunnerDeps(), outputCallback);
 
-  return true;
+  // ── Phase 5: Cleanup & Error Recovery ──────────────────────────────
+  return cleanupPhase(ctx, timers, output, {
+    channel,
+    queue,
+    lastAgentTimestamp,
+    saveState,
+  });
 }
 
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
 
-  // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
-
-  try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid,
-        isMain,
-      },
-      (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
-    );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return 'error';
-    }
-
-    return 'success';
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
-  }
-}
 
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
@@ -348,11 +296,62 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] || '',
             ASSISTANT_NAME,
           );
-          const messagesToSend =
+          const rawMessagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+          const trimmed = trimMainContextMessages(rawMessagesToSend);
+          const messagesToSend = trimmed.messages;
           const formatted = formatMessages(messagesToSend);
+          const pipeStageHint = inferStageHint(messagesToSend[messagesToSend.length - 1]?.content || '');
+          if (trimmed.dropped > 0) {
+            appendSwarmAction(group.folder, {
+              action: 'context_trimmed',
+              stage: pipeStageHint,
+              detail: `trimmed ${trimmed.dropped} old messages before dispatch`,
+              meta: { chatJid, dropped: trimmed.dropped, kept: messagesToSend.length, max: MAIN_CONTEXT_MESSAGES },
+            });
+          }
 
           if (queue.sendMessage(chatJid, formatted)) {
+            // Container already running; still send ack + status so the user sees activity.
+            try {
+              updateSwarmStatus({
+                groupFolder: group.folder,
+                stage: pipeStageHint,
+                item: 'piped follow-up to active container',
+                files: [`data/ipc/${group.folder}/input`],
+                next: 'waiting for agent output',
+              });
+              writeSwarmMetrics(group.folder, {
+                stage: pipeStageHint,
+                item: 'piped follow-up to active container',
+                next: 'waiting for agent output',
+                chatJid,
+                files: [`data/ipc/${group.folder}/input`],
+                note: 'piped',
+              });
+              appendSwarmEvent(group.folder, {
+                kind: 'piped',
+                stage: pipeStageHint,
+                item: 'piped follow-up to active container',
+                next: 'waiting for agent output',
+                files: [`data/ipc/${group.folder}/input`],
+                chatJid,
+              });
+              appendSwarmAction(group.folder, {
+                action: 'piped',
+                stage: pipeStageHint,
+                detail: 'piped follow-up to active container',
+                files: [`data/ipc/${group.folder}/input`],
+                meta: { chatJid },
+              });
+              await maybeSendProcessingAck({
+                chatJid,
+                isMainGroup,
+                groupRequiresTrigger: group.requiresTrigger,
+              }, { sendMessage: (jid, text) => channel.sendMessage(jid, text) });
+            } catch {
+              // ignore
+            }
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -391,93 +390,128 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
-    }
-  }
 
-  // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
-  }
-}
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  loadCircuitBreakerState();
+  loadSecrets([...KNOWN_SECRETS]);
   loadState();
+  for (const group of Object.values(registeredGroups)) {
+    try {
+      const wf = reconcileWorkflowOnBoot({
+        groupFolder: group.folder,
+        staleMs: BOOT_STALE_RUNNING_MS,
+        maxRunning: BOOT_MAX_RUNNING_TASKS,
+      });
+      const lanes = reconcileLaneStateOnBoot(group.folder, BOOT_STALE_RUNNING_MS);
+      if (wf.changed || lanes.changed) {
+        appendSwarmAction(group.folder, {
+          action: 'boot_recovery',
+          stage: 'TEAMLEAD',
+          detail: `boot recovery applied (workflowChanged=${wf.changed}, laneChanged=${lanes.changed})`,
+          files: [
+            `groups/${group.folder}/swarmdev/workflow-state.json`,
+            `groups/${group.folder}/swarmdev/lane-state.json`,
+          ],
+          meta: {
+            staleMs: BOOT_STALE_RUNNING_MS,
+            maxRunning: BOOT_MAX_RUNNING_TASKS,
+            workflow: wf,
+            laneStale: lanes.staleLanes,
+            touchedTasks: [...new Set([...wf.blockedTaskIds, ...lanes.touchedTasks])].slice(0, 40),
+          },
+        });
+      }
+      const taskIdsToBlock = new Set<string>([...wf.blockedTaskIds, ...lanes.touchedTasks]);
+      for (const taskId of taskIdsToBlock) {
+        try {
+          await setTodoState({ groupFolder: group.folder, taskId, state: 'blocked', skipAutoAdvance: true });
+        } catch {
+          // ignore
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, groupFolder: group.folder }, 'Boot recovery failed for group');
+    }
+  }
+  syncTodoLaneProgressFromLaneState(MAIN_GROUP_FOLDER);
+  for (const group of Object.values(registeredGroups)) {
+    syncTodoLaneProgressFromLaneState(group.folder);
+  }
+
+  // Clear stale "working" UI state after restarts so the dash doesn't look stuck.
+  try {
+    // Always refresh main (dash reads groups/main).
+    updateSwarmStatus({
+      groupFolder: MAIN_GROUP_FOLDER,
+      stage: 'idle',
+      item: 'boot',
+      files: [`groups/${MAIN_GROUP_FOLDER}/swarmdev/status.md`],
+      next: 'awaiting next message',
+    });
+    writeSwarmMetrics(MAIN_GROUP_FOLDER, {
+      stage: 'idle',
+      item: 'boot',
+      next: 'awaiting next message',
+      note: 'boot',
+    });
+    appendSwarmEvent(MAIN_GROUP_FOLDER, {
+      kind: 'status',
+      stage: 'idle',
+      item: 'boot',
+      next: 'awaiting next message',
+      msg: 'booted; cleared stale dash state',
+    });
+
+    for (const group of Object.values(registeredGroups)) {
+      updateSwarmStatus({
+        groupFolder: group.folder,
+        stage: 'idle',
+        item: 'boot',
+        files: [`groups/${group.folder}/swarmdev/status.md`],
+        next: 'awaiting next message',
+      });
+      writeSwarmMetrics(group.folder, {
+        stage: 'idle',
+        item: 'boot',
+        next: 'awaiting next message',
+        note: 'boot',
+      });
+      appendSwarmEvent(group.folder, {
+        kind: 'status',
+        stage: 'idle',
+        item: 'boot',
+        next: 'awaiting next message',
+        msg: 'booted; cleared stale dash state',
+      });
+    }
+  } catch {
+    // ignore
+  }
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
-    await whatsapp.disconnect();
+    await channel.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   // Create WhatsApp channel
-  whatsapp = new WhatsAppChannel({
+  const whatsapp = new WhatsAppChannel({
     onMessage: (chatJid, msg) => storeMessage(msg),
     onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
     registeredGroups: () => registeredGroups,
   });
+  channel = whatsapp;
 
   // Connect — resolves when first connected
-  await whatsapp.connect();
+  await channel.connect();
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -486,12 +520,12 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const text = formatOutbound(whatsapp, rawText);
-      if (text) await whatsapp.sendMessage(jid, text);
+      const text = formatOutbound(channel, rawText);
+      if (text) await channel.sendMessage(jid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
+    sendMessage: (jid, text) => channel.sendMessage(jid, text),
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: (force) => whatsapp.syncGroupMetadata(force),

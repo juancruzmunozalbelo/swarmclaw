@@ -81,7 +81,7 @@ export class WhatsAppChannel implements Channel {
 
       if (connection === 'close') {
         this.connected = false;
-        const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+        const reason = ((lastDisconnect?.error as unknown as Record<string, unknown>)?.output as Record<string, unknown> | undefined)?.statusCode as number | undefined;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
         logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
 
@@ -104,7 +104,7 @@ export class WhatsAppChannel implements Channel {
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
-        this.sock.sendPresenceUpdate('available').catch(() => {});
+        this.sock.sendPresenceUpdate('available').catch(() => { });
 
         // Build LID to phone mapping from auth state for self-chat translation
         if (this.sock.user) {
@@ -147,6 +147,10 @@ export class WhatsAppChannel implements Channel {
 
     this.sock.ev.on('messages.upsert', async ({ messages }) => {
       for (const msg of messages) {
+        const earlyJid = msg.key.remoteJid || 'none';
+        const hasMessage = !!msg.message;
+        const fromMe = msg.key.fromMe;
+        logger.info({ earlyJid, hasMessage, fromMe, pushName: msg.pushName, id: msg.key.id?.slice(0, 10) }, 'RAW message.upsert');
         if (!msg.message) continue;
         const rawJid = msg.key.remoteJid;
         if (!rawJid || rawJid === 'status@broadcast') continue;
@@ -163,7 +167,9 @@ export class WhatsAppChannel implements Channel {
 
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
-        if (groups[chatJid]) {
+        const isRegistered = !!groups[chatJid];
+        logger.info({ rawJid, chatJid, isRegistered, fromMe: msg.key.fromMe, pushName: msg.pushName }, 'Message received');
+        if (isRegistered) {
           const content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
@@ -282,6 +288,22 @@ export class WhatsAppChannel implements Channel {
       }
     } catch (err) {
       logger.debug({ err, jid }, 'Failed to resolve LID via signalRepository');
+    }
+
+    // Fallback: if this LID is our own (self-chat), map it to our phone JID.
+    // Baileys identity can change during the session; this keeps self-chat working
+    // even if lidMapping isn't available yet.
+    try {
+      const myPhone = this.sock.user?.id?.split(':')[0];
+      const myLid = this.sock.user?.lid?.split(':')[0];
+      if (myPhone && myLid && lidUser === myLid) {
+        const phoneJid = `${myPhone}@s.whatsapp.net`;
+        this.lidToPhoneMap[lidUser] = phoneJid;
+        logger.info({ lidJid: jid, phoneJid }, 'Translated LID to phone JID (self fallback)');
+        return phoneJid;
+      }
+    } catch {
+      // ignore
     }
 
     return jid;

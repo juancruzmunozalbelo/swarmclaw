@@ -1,0 +1,31 @@
+{
+  "name": "contable-api",
+  "version": "1.0.0",
+  "description": "API Contable con Fastify + TypeScript + Drizzle",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "@fastify/jwt": "^8.0.1",
+    "drizzle-orm": "^0.36.4",
+    "postgres": "^3.4.5",
+    "dotenv": "^16.4.7",
+    "bcryptjs": "^2.4.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "@types/node": "^22.10.7",
+    "@types/bcryptjs": "^2.4.6",
+    "drizzle-kit": "^0.30.1"
+  }
+}
