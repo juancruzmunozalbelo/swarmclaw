@@ -495,6 +495,14 @@ Run <code>claude</code>, then <code>/debug</code>. Or check <code>logs/nanoclaw.
 
 ---
 
+## 🌐 Ecosystem
+
+| Project | Description |
+|---|---|
+| [🐾 SwarmClaw](https://github.com/juancruzmunozalbelo/swarmclaw) | Autonomous multi-agent swarm control plane (you are here) |
+| [🏛️ SwarmDash](https://github.com/juancruzmunozalbelo/swarmdash) | Real-time AI agent dashboard |
+| [🖥️ KaizenTerm](https://github.com/juancruzmunozalbelo/kaizen-term) | Multi-agent terminal orchestrator |
+
 ## Community
 
 Questions? Ideas? [Join the Discord](https://discord.gg/VGWXrf8x).
