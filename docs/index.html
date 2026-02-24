@@ -150,6 +150,67 @@
             text-decoration: none;
         }
 
+        .hero-screenshot {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+
+        .browser-mockup {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: #111;
+            border-radius: 12px;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(167, 139, 250, 0.2);
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transform: translateY(20px);
+        }
+
+        .browser-header {
+            background: #222;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .browser-dots {
+            display: flex;
+            gap: 8px;
+        }
+
+        .browser-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .dot-close {
+            background: #ff5f56;
+        }
+
+        .dot-min {
+            background: #ffbd2e;
+        }
+
+        .dot-max {
+            background: #27c93f;
+        }
+
+        .browser-url {
+            margin: 0 auto;
+            background: #111;
+            padding: 4px 24px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--muted);
+            font-family: 'Inter', sans-serif;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            /* Move it slightly left so it centers visually despite the dots */
+            transform: translateX(-24px);
+        }
+
         .arch {
             max-width: 800px;
             margin: 0 auto 48px;
@@ -365,6 +426,18 @@
             <a href="https://github.com/juancruzmunozalbelo/swarmclaw/archive/refs/heads/main.zip"
                 class="btn btn-secondary">⏬ Download ZIP</a>
         </div>
+
+        <div class="browser-mockup">
+            <div class="browser-header">
+                <div class="browser-dots">
+                    <div class="browser-dot dot-close"></div>
+                    <div class="browser-dot dot-min"></div>
+                    <div class="browser-dot dot-max"></div>
+                </div>
+                <div class="browser-url">swarmdash.local</div>
+            </div>
+            <img src="screenshot.png" alt="SwarmDash visualizing SwarmClaw agents" class="hero-screenshot">
+        </div>
     </section>
 
     <div class="arch">
@@ -515,7 +588,8 @@
 
     <footer>
         <p>Built by <a href="https://github.com/juancruzmunozalbelo">Juan Cruz Muñoz Albelo</a> · MIT License · Built on
-            <a href="https://github.com/gavrielc/nanoclaw">NanoClaw</a></p>
+            <a href="https://github.com/gavrielc/nanoclaw">NanoClaw</a>
+        </p>
     </footer>
 </body>
 
